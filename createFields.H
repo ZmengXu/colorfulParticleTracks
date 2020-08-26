@@ -11,8 +11,8 @@ IOdictionary propsDict
 
 const word cloudName(propsDict.lookup("cloudName"));
 
+List<word> selectedLagrangianFieldNames(propsDict.lookup("fields"));
+
 label sampleFrequency(readLabel(propsDict.lookup("sampleFrequency")));
 
 label maxPositions(readLabel(propsDict.lookup("maxPositions")));
-
-word setFormat(propsDict.lookupOrDefault<word>("setFormat", "vtk"));

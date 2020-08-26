@@ -37,8 +37,9 @@ Description
 #include "Time.H"
 #include "timeSelector.H"
 #include "OFstream.H"
-#include "passiveParticleCloud.H"
 #include "writer.H"
+#include "passiveParticleCloud.H"
+#include "particleTracksTemplates.H"
 
 using namespace Foam;
 
@@ -46,16 +47,9 @@ using namespace Foam;
 
 int main(int argc, char *argv[])
 {
+    argList::noParallel();
     timeSelector::addOptions();
     #include "addRegionOption.H"
-    argList::addOption
-    (
-        "lagrangianFields",
-        "list",
-        "specify a list of lagrangian fields to be reconstructed. Eg, '(d T)' -"
-        "only scalar field is supported currently, "
-        "positions always included."
-    );
     #include "setRootCase.H"
 
     #include "createTime.H"
@@ -65,208 +59,186 @@ int main(int argc, char *argv[])
 
     // * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * //
 
-    fileName vtkPath(runTime.path()/"VTK");
-    mkDir(vtkPath);
-
     Info<< "Scanning times to determine track data for cloud " << cloudName
         << nl << endl;
 
-    labelList maxIds(Pstream::nProcs(), -1);
+    // max number of originating procs number
+    label maxNProcs = 1;
+    // the max Id number + 1 for each original processor
+    labelList numIds(maxNProcs, 0);
+    // allCloud is the combination of different time
+    PtrList<passiveParticleCloud> allCloud(0);
+    PtrList<IOobjectList> cloudObjsList(0);
+	
+	label nCloud = 0;
     forAll(timeDirs, timeI)
     {
         runTime.setTime(timeDirs[timeI], timeI);
         Info<< "Time = " << runTime.timeName() << endl;
 
-        Info<< "    Reading particle positions" << endl;
-        passiveParticleCloud myCloud(mesh, cloudName);
+        Info<< "    Reading the dictionary of cloudObjs" << endl;
 
-        Info<< "    Read " << returnReduce(myCloud.size(), sumOp<label>())
-            << " particles" << endl;
-
-        forAllConstIter(passiveParticleCloud, myCloud, iter)
+		fileName cloudDir = cloud::prefix/cloudName;
+		fileName lagrangianDir = runTime.path()/runTime.timeName()/cloudDir;
+        // check the folder in the time step,
+        // if true number of cloud nCloud ++;
+		if (!isDir(lagrangianDir) || lagrangianDir.empty())
         {
-            label origId = iter().origId();
-            label origProc = iter().origProc();
-
-            if (origProc >= maxIds.size())
-            {
-                maxIds.setSize(origProc+1, -1);
-            }
-
-            maxIds[origProc] = max(maxIds[origProc], origId);
+            Info<< "    The dictionary " << lagrangianDir
+                << " is empty, jump to next time" << endl;
         }
+        else
+		{
+			cloudObjsList.append
+			(
+				new IOobjectList
+				(
+					mesh,
+					runTime.timeName(),
+					cloud::prefix/cloudName
+				)
+			);
+			allCloud.append
+			(
+				new passiveParticleCloud
+				(
+					mesh,
+					cloudName
+				)
+			);
+			
+			Info<< "    Reading particle positions and origId, origProc" << endl;
+			
+			passiveParticleCloud& myCloud = allCloud[nCloud];
+
+			Info<< "    Read " << myCloud.size() << " particles" << endl;
+
+			forAllConstIter(passiveParticleCloud, myCloud, iter)
+			{
+				label origId = iter().origId();
+				label origProc = iter().origProc();
+				// origProc is starting from 0
+				if (origProc >= maxNProcs)
+				{
+					maxNProcs = origProc+1;
+					numIds.setSize(origProc+1, 0);
+				}
+				numIds[origProc] = max(numIds[origProc], origId+1);
+			}
+			nCloud ++;
+		}
     }
 
-    label maxNProcs = returnReduce(maxIds.size(), maxOp<label>());
-
-    Info<< "Detected particles originating from " << maxNProcs
+    Info<< nl
+		<< "Detected particles originating from " << maxNProcs
         << " processors." << nl << endl;
 
-    maxIds.setSize(maxNProcs, -1);
-
-    Pstream::listCombineGather(maxIds, maxEqOp<label>());
-    Pstream::listCombineScatter(maxIds);
-
-    labelList numIds = maxIds + 1;
-
     Info<< nl << "Particle statistics:" << endl;
-    forAll(maxIds, proci)
+    forAll(numIds, proci)
     {
         Info<< "    Found " << numIds[proci] << " particles originating"
             << " from processor " << proci << endl;
     }
     Info<< nl << endl;
 
-
     // Calculate starting ids for particles on each processor
-    List<label> startIds(numIds.size(), 0);
-    for (label i = 0; i < numIds.size()-1; i++)
+    List<label> startIds(maxNProcs, 0);
+    for (label proci = 0; proci < maxNProcs-1; proci++)
     {
-        startIds[i+1] += startIds[i] + numIds[i];
-    }
-    label nParticle = startIds.last() + numIds[startIds.size()-1];
-
-
-    // Number of tracks to generate
-    label nTracks = nParticle/sampleFrequency;
-
-    // Storage for all particle tracks
-    List<DynamicList<vector>> allTracks(nTracks);
-
-
-    List<word> selectedLagrangianFields;
-    if (args.optionFound("lagrangianFields"))
-    {
-        args.optionLookup("lagrangianFields")() >> selectedLagrangianFields;
+        startIds[proci+1] += startIds[proci] + numIds[proci];
     }
 
-    Info<< "\nLooking for the lagrangianFields " 
-        << selectedLagrangianFields << nl << endl;
+    // The total number of particles originating from all the processors
+    label nParticles = sum(numIds);
+    //label nParticles = startIds.last() + numIds[maxNProcs-1];
 
-    // Storage for all fields tracks
-    List<List<DynamicList<scalar>>> allTrackFields(selectedLagrangianFields.size());
-    forAll(allTrackFields, fieldI)
+    // Number of tracks to generate, sampleFrequency is the averaged number of particle
+    label nTracks = nParticles/sampleFrequency;
+    if (nTracks == 0)
     {
-        allTrackFields[fieldI].setSize
-        (
-            nTracks
-        );
+        Info<< "\n    No track data for writting" << endl;
+        return 0;
     }
 
     Info<< "\nGenerating " << nTracks << " particle tracks for cloud "
         << cloudName << nl << endl;
 
-    forAll(timeDirs, timeI)
+    // Storage the particle index for all sample point in the track lines
+    // The first dimension is trackI, second is sampleI
+    //List<DynamicList<label>> cloudMap(nTracks);
+    //List<DynamicList<label>> particleMap(nTracks);
+
+    // Storage for all particle positions
+    List<DynamicList<vector>> trackedPositions(nTracks);
+    // Storage the globalParticleI index at
+    // all the sample point sampleI in the track lines trackI
+    // It is used to write the VTK LINES connections
+    List<DynamicList<label>> globalParticleMap(nTracks);
+
+    // A bool list for checking the particle
+    // If the particle is tracked
+    // sampleParticleMap[iCloud][iParticle] is ture
+    List<List<bool>> sampleParticleMap(allCloud.size());
+
+    label globalParticleI = 0;
+    forAll(allCloud, iCloud)
     {
-        runTime.setTime(timeDirs[timeI], timeI);
-        Info<< "Time = " << runTime.timeName() << endl;
+        passiveParticleCloud& myCloud = allCloud[iCloud];
+        sampleParticleMap[iCloud].setSize(myCloud.size(), false);
 
-        List<pointField> allPositions(Pstream::nProcs());
-        List<labelField> allOrigIds(Pstream::nProcs());
-        List<labelField> allOrigProcs(Pstream::nProcs());
-
-        // Read particles. Will be size 0 if no particles.
-        Info<< "    Reading particle positions" << endl;
-        passiveParticleCloud myCloud(mesh, cloudName);
-
-        // Collect the track data on all processors that have positions
-        allPositions[Pstream::myProcNo()].setSize
-        (
-            myCloud.size(),
-            point::zero
-        );
-        allOrigIds[Pstream::myProcNo()].setSize(myCloud.size(), 0);
-        allOrigProcs[Pstream::myProcNo()].setSize(myCloud.size(), 0);
-
-        label i = 0;
+        label iParticle = 0;
         forAllConstIter(passiveParticleCloud, myCloud, iter)
         {
-            allPositions[Pstream::myProcNo()][i] = iter().position();
-            allOrigIds[Pstream::myProcNo()][i] = iter().origId();
-            allOrigProcs[Pstream::myProcNo()][i] = iter().origProc();
-            i++;
-        }
+            label origId = iter().origId();
+            label origProc = iter().origProc();
+            label globalId = startIds[origProc] + origId;
 
-        // Collect the track data on the master processor
-        Pstream::gatherList(allPositions);
-        Pstream::gatherList(allOrigIds);
-        Pstream::gatherList(allOrigProcs);
-        
-        PtrList<List<scalarField>> allLagrangianfields(selectedLagrangianFields.size());
-        forAll(selectedLagrangianFields, fieldI)
-        {
-            allLagrangianfields.set
-            (
-                fieldI,
-                new List<scalarField>
-                (
-                    Pstream::nProcs()
-                )
-            );
+            point positions = iter().position();
 
-            const word fieldName = selectedLagrangianFields[fieldI];
-            // Check object on local mesh
-            IOobject fieldIOobject
-            (
-                fieldName,
-                runTime.timeName(),
-                cloud::prefix/cloudName,
-                mesh,
-                IOobject::MUST_READ,
-                IOobject::NO_WRITE
-            );
-
-            if (fieldIOobject.typeHeaderOk<IOField<scalar>>(true))
+            if (globalId % sampleFrequency == 0)
             {
-                IOField<scalar> scalarIOField(fieldIOobject);
-                Field<scalar>& scalarField(scalarIOField);
-                allLagrangianfields[fieldI][Pstream::myProcNo()]=scalarField;
-            }
-
-            Pstream::gatherList(allLagrangianfields[fieldI]);
-        }
-
-
-        Info<< "    Constructing tracks" << nl << endl;
-        if (Pstream::master())
-        {
-            forAll(allPositions, proci)
-            {
-                forAll(allPositions[proci], i)
+                label trackI = globalId/sampleFrequency;
+                label trackLength = trackedPositions[trackI].size();
+                if (trackLength < maxPositions)
                 {
-                    label globalId =
-                        startIds[allOrigProcs[proci][i]]
-                      + allOrigIds[proci][i];
+                    // particleMap and cloudMap have a two dimensions
+                    // cloudMap[trackI][sampleI] = iCloud;
+                    // particleMap[trackI][sampleI] = iParticle;
+                    //cloudMap[trackI].append( iCloud );
+                    //particleMap[trackI].append( iParticle );
 
-                    if (globalId % sampleFrequency == 0)
-                    {
-                        label trackId = globalId/sampleFrequency;
-                        if (allTracks[trackId].size() < maxPositions)
-                        {
-                            allTracks[trackId].append
-                            (
-                                allPositions[proci][i]
-                            );
+                    trackedPositions[trackI].append( positions );
+                    globalParticleMap[trackI].append( globalParticleI );
+                    sampleParticleMap[iCloud][iParticle] = true;
 
-                            forAll(allLagrangianfields, fieldI)
-                            {
-                                allTrackFields[fieldI][trackId].append
-                                (
-                                    allLagrangianfields[fieldI][proci][i]
-                                );
-                            }
-                        }
-                    }
+                    globalParticleI ++;
                 }
             }
+            iParticle++;
         }
     }
 
 
+    //- start to write the data
     if (Pstream::master())
     {
-        PtrList<coordSet> tracks(allTracks.size());
-        forAll(allTracks, trackI)
+        Info<< "\n    Generating " << nTracks << " tracks for cloud"
+            << cloudName << nl << endl;
+
+        fileName vtkPath(runTime.path()/"VTK");
+        mkDir(vtkPath);
+
+        OFstream os(vtkPath/"particleTracks.vtk");
+
+        Info<< "\n    Writing particle tracks to " << os.name() << endl;
+
+        os  << "# vtk DataFile Version 2.0" << nl
+            << "particleTracks" << nl
+            << "ASCII" << nl
+            << "DATASET POLYDATA" << nl;
+
+        PtrList<coordSet> tracks(nTracks);
+        forAll(tracks, trackI)
         {
             tracks.set
             (
@@ -277,58 +249,156 @@ int main(int argc, char *argv[])
                     "distance"
                 )
             );
-            tracks[trackI].transfer(allTracks[trackI]);
+            // a list of points for the trackI line
+            tracks[trackI].transfer
+            (
+                trackedPositions[trackI]
+            );
         }
 
-        List<List<scalarField>> trackFields(allTrackFields.size());
-        forAll(trackFields, fieldI)
+        label nPoints = 0;
+        forAll(tracks, i)
         {
-            trackFields[fieldI].setSize
-            (
-                nTracks
-            );
-            forAll(trackFields[fieldI], trackI)
+            nPoints += tracks[i].size();
+        }
+
+        Info<< "\n    Writing points" << endl;
+
+        os  << "POINTS " << nPoints << " float" << nl;
+
+        forAll(allCloud, iCloud)
+        {
+            passiveParticleCloud& myCloud = allCloud[iCloud];
+            label iParticle = 0;
+            forAllConstIter(passiveParticleCloud, myCloud, iter)
             {
-                trackFields[fieldI][trackI] = allTrackFields[fieldI][trackI];
+                const vector& pt = iter().position();
+                if( sampleParticleMap[iCloud][iParticle] )
+                {
+                    os  << pt.x() << ' ' << pt.y() << ' ' << pt.z() << nl;
+                }
+                iParticle++;
             }
         }
 
-        autoPtr<writer<scalar>> scalarFormatterPtr = writer<scalar>::New
+        // Write track (line) connectivity to file
+        Info<< "\n    Writing track lines" << endl;
+
+        os  << "LINES " << nTracks << ' ' << nPoints+nTracks << nl;
+
+        forAll(tracks, trackI)
+        {
+            os  << globalParticleMap[trackI].size();
+            forAll(globalParticleMap[trackI], sampleI)
+            {
+                os  << ' ' << globalParticleMap[trackI][sampleI];
+            }
+            os << nl;
+        }
+
+		// Extract the fields name list		
+		const List<word> labelFieldNames = validFields<label>
         (
-            setFormat
+            selectedLagrangianFieldNames,
+            cloudObjsList
+        );
+		const List<word> scalarFieldNames = validFields<scalar>
+        (
+            selectedLagrangianFieldNames,
+            cloudObjsList
+        );
+		const List<word> vectorFieldNames = validFields<vector>
+        (
+            selectedLagrangianFieldNames,
+            cloudObjsList
+        );
+		const List<word> sphericalTensorFieldNames = validFields<sphericalTensor>
+        (
+            selectedLagrangianFieldNames,
+            cloudObjsList
+        );
+		const List<word> symmTensorFieldNames = validFields<symmTensor>
+        (
+            selectedLagrangianFieldNames,
+            cloudObjsList
+        );
+		const List<word> tensorFieldNames = validFields<tensor>
+        (
+            selectedLagrangianFieldNames,
+            cloudObjsList
         );
 
-        // OFstream vtkTracks(vtkPath/"particleTracks.vtk");
-        fileName vtkFile
-        (
-            scalarFormatterPtr().getFileName
-            (
-                tracks[0],
-                wordList(0)
-            )
-        );
+		const label nFields = labelFieldNames.size()
+							+ scalarFieldNames.size()
+							+ vectorFieldNames.size()
+							+ sphericalTensorFieldNames.size()
+							+ symmTensorFieldNames.size()
+							+ tensorFieldNames.size();
 
-        OFstream vtkTracks
-        (
-            vtkPath/("particleTracks." + vtkFile.ext())
-        );
+        os  << "POINT_DATA " << nPoints << nl
+            << "FIELD attributes " << nFields << nl;
 
-        Info<< "\nWriting particle tracks in " << setFormat
-            << " format to " << vtkTracks.name()
-            << nl << endl;
+        Info<< "\n    Processing fields" << nl << endl;
 
-        scalarFormatterPtr().write
-        (
-            true,
-            tracks,
-            selectedLagrangianFields,//wordList(trackFields.size()),
-            trackFields,//List<List<scalarField>>(0),
-            vtkTracks
-        );
+		Info<< "    Processing label fields" << endl;
+		forAll(labelFieldNames, iName)
+		{
+			const word& fieldName = labelFieldNames[iName];
+			os  << nl << fieldName << ' ' << pTraits<label>::nComponents
+				<< ' ' << nPoints << " float" << nl;
+			processField<label>(os, fieldName, sampleParticleMap, cloudObjsList);
+		}
+
+		Info<< "    Processing scalar fields" << endl;
+		forAll(scalarFieldNames, iName)
+		{
+			const word& fieldName = scalarFieldNames[iName];
+			os  << nl << fieldName << ' ' << pTraits<scalar>::nComponents
+				<< ' ' << nPoints << " float" << nl;
+			processField<scalar>(os, fieldName, sampleParticleMap, cloudObjsList);
+		}
+
+		Info<< "    Processing vector fields" << endl;
+		forAll(vectorFieldNames, iName)
+		{
+			const word& fieldName = vectorFieldNames[iName];
+			os  << nl << fieldName << ' ' << pTraits<vector>::nComponents
+				<< ' ' << nPoints << " float" << nl;
+			processField<vector>(os, fieldName, sampleParticleMap, cloudObjsList);
+		}
+
+		Info<< "    Processing sphericalTensor fields" << endl;
+		forAll(sphericalTensorFieldNames, iName)
+		{
+			const word& fieldName = sphericalTensorFieldNames[iName];
+			os  << nl << fieldName << ' ' << pTraits<sphericalTensor>::nComponents
+				<< ' ' << nPoints << " float" << nl;
+			processField<sphericalTensor>(os, fieldName, sampleParticleMap, cloudObjsList);
+		}
+
+		Info<< "    Processing symmTensor fields" << endl;
+		forAll(symmTensorFieldNames, iName)
+		{
+			const word& fieldName = symmTensorFieldNames[iName];
+			os  << nl << fieldName << ' ' << pTraits<symmTensor>::nComponents
+				<< ' ' << nPoints << " float" << nl;
+			processField<symmTensor>(os, fieldName, sampleParticleMap, cloudObjsList);
+		}
+
+		Info<< "    Processing tensor fields" << endl;
+		forAll(tensorFieldNames, iName)
+		{
+			const word& fieldName = tensorFieldNames[iName];
+			os  << nl << fieldName << ' ' << pTraits<tensor>::nComponents
+				<< ' ' << nPoints << " float" << nl;
+			processField<tensor>(os, fieldName, sampleParticleMap, cloudObjsList);
+		}
+
     }
+
+    Info<< "End\n" << endl;
 
     return 0;
 }
-
 
 // ************************************************************************* //
