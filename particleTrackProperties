@@ -25,7 +25,7 @@ fields
 
 // Number of track is nPoints/sampleFrequency
 // Average number of points in each track
-sampleFrequency 2;
+sampleFrequency 1;
 
 // Max number of points in each track
 maxPositions    1000000;
